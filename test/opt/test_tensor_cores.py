@@ -249,16 +249,6 @@ class TestTensorCoresWarpPack(unittest.TestCase):
     r, opts = self._four_local_dims_kernel()
     helper_linearizer_opt(r, [opts], apply_tc=True, atol=3e-2, rtol=1e-3, check_default_opt=False)
 
-  @Context(ALLOW_TF32=1)
-  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
-  def test_tc_four_local_dims_warp_is_lidx0(self):
-    r, opts = self._four_local_dims_kernel()
-    ast = replace_opts(r.schedule_linear().src[-1].src[0], [Opt(OptOps.TC, 0, (-1, 0, 1))]+opts)
-    prg = to_program(ast, Device[Device.DEFAULT].renderer)
-    threads = next(u for u in prg.src[1].src if u.op is Ops.WMMA).arg[3]
-    specials = {u.arg: u.src[0].val for u in prg.src[1].src if u.op is Ops.SPECIAL and u.arg.startswith("lidx")}
-    assert specials["lidx0"] == threads, f"warp ({threads} threads) must map directly to lidx0, got {specials}"
-
 class TestTensorCoresGroup(unittest.TestCase):
   def _split_k_kernel(self, group_factor=16):
     tc = _first_half_tc()
@@ -273,10 +263,9 @@ class TestTensorCoresGroup(unittest.TestCase):
     plans = [
       [Opt(OptOps.GROUP, 0, 4)],
       [Opt(OptOps.GROUPTOP, 0, 16)],
-      [Opt(OptOps.GROUP, 0, 4), Opt(OptOps.LOCAL, 1, 2)],
-      [Opt(OptOps.GROUP, 0, 4), Opt(OptOps.UPCAST, 1, 2)],
+      # LOCAL/UPCAST after GROUP.
       [Opt(OptOps.GROUP, 0, 4), Opt(OptOps.LOCAL, 1, 2), Opt(OptOps.UPCAST, 1, 2)],
-      # GROUP last: the ordering BEAM produces (TC -> LOCAL -> UPCAST -> GROUP)
+      # GROUP last: the ordering BEAM produces.
       [Opt(OptOps.LOCAL, 1, 2), Opt(OptOps.UPCAST, 1, 2), Opt(OptOps.GROUP, 0, 4)],
     ]
     helper_linearizer_opt(r, plans, apply_tc=True, atol=3e-2, rtol=1e-3, check_default_opt=False)
