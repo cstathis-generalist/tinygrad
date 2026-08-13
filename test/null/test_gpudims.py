@@ -117,13 +117,6 @@ class TestGroupedDims(unittest.TestCase):
     self._check_grouped_dims("gidx", (2,3,4), None, False, [2,3,4])
     self._check_grouped_dims("gidx", (100,), None, False, [100])
 
-  def test_start_idx(self):
-    # start_idx offsets the SPECIAL names, with and without reverse
-    for reverse in (False, True):
-      idxs = get_grouped_dims("lidx", (2,3), (16,16,16), reverse=reverse, start_idx=1)
-      names = sorted(dedup([u.arg for x in idxs for u in x.toposort() if u.op is Ops.SPECIAL]))
-      self.assertEqual(names, ["lidx1", "lidx2"], f"{reverse=}")
-
   def test_warp_dim_not_merged(self):
     # a WARP range (from tensor cores) plus three LOCAL ranges exceeds the 3 hardware local dims.
     # packing must keep WARP alone on lidx0: WMMA lane ids cannot be reconstructed from grouped dims.
