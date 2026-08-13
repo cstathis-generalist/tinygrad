@@ -171,8 +171,9 @@ def fix_group_for_reduce(x:UOp):
   reduce_gfr, reduce_r = partition(x.src[1:], lambda u: u.op is Ops.RANGE and u.arg[1] == AxisType.GROUP_REDUCE)
   if len(reduce_gfr) == 0: return None
 
-  # NOTE: if there's other locals here, we need them in the buffer too
-  upstream_locals = [u for u in x.toposort() if u.op is Ops.RANGE and u.arg[1] == AxisType.LOCAL]
+  # NOTE: if there's other locals here, we need them in the buffer too. WARP counts as a local:
+  # the staging buffer must preserve per-lane WMMA fragments
+  upstream_locals = [u for u in x.toposort() if u.op is Ops.RANGE and u.arg[1] in (AxisType.LOCAL, AxisType.WARP)]
 
   # do only the non grouped reduces early
   ret = x.replace(src=(x.src[0],)+tuple(reduce_r))

@@ -225,5 +225,114 @@ class TestTensorCores(unittest.TestCase):
         #assert u.src[-1].dtype == dtypes.float.vec(prod(tc.thread_local_sizes[2]))
         assert u.src[-1].src[0].op != Ops.STORE
 
+def _first_half_tc():
+  tcs = [tc for tc in Device[Device.DEFAULT].renderer.tensor_cores if tc.dtype_in is dtypes.half]
+  if not tcs: raise unittest.SkipTest("test requires a half tensor core")
+  return tcs[0]
+
+class TestTensorCoresWarpPack(unittest.TestCase):
+  # TC plus three LOCAL opts creates four logical local dims (WARP + 3 LOCAL), more than the
+  # 3 hardware dims: packing must keep the WARP on its own hardware dim (lidx0) or WMMA lane
+  # ids straddle hardware warps and results are silently wrong.
+  def _four_local_dims_kernel(self):
+    tc = _first_half_tc()
+    n, m, k = tc.dims
+    a, b = Tensor.rand(m*8, k*2, dtype=tc.dtype_in), Tensor.rand(k*2, n*4, dtype=tc.dtype_in)
+    r = a.matmul(b, dtype=tc.dtype_out)
+    # partially localize both globals (M twice, N once), leaving them alive so indices are stable
+    opts = [Opt(OptOps.LOCAL, 0, 2), Opt(OptOps.LOCAL, 0, 2), Opt(OptOps.LOCAL, 1, 2)]
+    return r, opts
+
+  @Context(ALLOW_TF32=1)
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tc_four_local_dims_allclose(self):
+    r, opts = self._four_local_dims_kernel()
+    helper_linearizer_opt(r, [opts], apply_tc=True, atol=3e-2, rtol=1e-3, check_default_opt=False)
+
+  @Context(ALLOW_TF32=1)
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tc_four_local_dims_warp_is_lidx0(self):
+    r, opts = self._four_local_dims_kernel()
+    ast = replace_opts(r.schedule_linear().src[-1].src[0], [Opt(OptOps.TC, 0, (-1, 0, 1))]+opts)
+    prg = to_program(ast, Device[Device.DEFAULT].renderer)
+    threads = next(u for u in prg.src[1].src if u.op is Ops.WMMA).arg[3]
+    specials = {u.arg: u.src[0].val for u in prg.src[1].src if u.op is Ops.SPECIAL and u.arg.startswith("lidx")}
+    assert specials["lidx0"] == threads, f"warp ({threads} threads) must map directly to lidx0, got {specials}"
+
+class TestTensorCoresGroup(unittest.TestCase):
+  def _split_k_kernel(self, group_factor=16):
+    tc = _first_half_tc()
+    n, m, k = tc.dims
+    a, b = Tensor.rand(m*4, k*group_factor, dtype=tc.dtype_in), Tensor.rand(k*group_factor, n*4, dtype=tc.dtype_in)
+    return a.matmul(b, dtype=tc.dtype_out)
+
+  @Context(ALLOW_TF32=1)
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tc_group_allclose(self):
+    r = self._split_k_kernel()
+    plans = [
+      [Opt(OptOps.GROUP, 0, 4)],
+      [Opt(OptOps.GROUPTOP, 0, 16)],
+      [Opt(OptOps.GROUP, 0, 4), Opt(OptOps.LOCAL, 1, 2)],
+      [Opt(OptOps.GROUP, 0, 4), Opt(OptOps.UPCAST, 1, 2)],
+      [Opt(OptOps.GROUP, 0, 4), Opt(OptOps.LOCAL, 1, 2), Opt(OptOps.UPCAST, 1, 2)],
+      # GROUP last: the ordering BEAM produces (TC -> LOCAL -> UPCAST -> GROUP)
+      [Opt(OptOps.LOCAL, 1, 2), Opt(OptOps.UPCAST, 1, 2), Opt(OptOps.GROUP, 0, 4)],
+    ]
+    helper_linearizer_opt(r, plans, apply_tc=True, atol=3e-2, rtol=1e-3, check_default_opt=False)
+
+  @Context(ALLOW_TF32=1)
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tc_shape_only_group_allclose(self):
+    # use_tensor_cores=2 applies the TC range restructuring without emitting WMMA
+    r = self._split_k_kernel()
+    plans = [
+      [Opt(OptOps.TC, 0, (-1, 0, 2)), Opt(OptOps.GROUP, 0, 4)],
+      [Opt(OptOps.TC, 0, (-1, 0, 2)), Opt(OptOps.GROUPTOP, 0, 16)],
+    ]
+    helper_linearizer_opt(r, plans, atol=3e-2, rtol=1e-3, check_default_opt=False)
+
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_group_nested_reduce_rejected(self):
+    # a genuine reduce-inside-a-reduce (matmul -> exp -> sum) must still reject GROUP
+    a, b = Tensor.empty(16, 16), Tensor.empty(16, 16)
+    ast = a.matmul(b).exp().sum(0).schedule_linear().src[-1].src[0]
+    errs = []
+    for axis in range(2):
+      try: to_program(replace_opts(ast, [Opt(OptOps.GROUP, axis, 4)]), Device[Device.DEFAULT].renderer)
+      except KernelOptError as e: errs.append(str(e))
+    assert any("inside another reduce" in msg for msg in errs), f"nested reduce GROUP must be rejected, got {errs}"
+
+  @Context(ALLOW_TF32=1)
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tc_group_unrelated_unroll_rejected(self):
+    # batched matmul -> exp -> sum(batch): TC emits a WMMA for the K contraction while the batch
+    # sum remains a genuine enclosing reduce. Fully unrolling the batch reduce leaves UNROLL
+    # context ranges that are NOT TC contraction fragments. Even after the size-1 REDUCE remnant
+    # of the unroll is simplified away, GROUP must reject those ranges: only the UNROLL ranges
+    # created by _apply_tc_opt are exempt from the nested-reduce check.
+    from tinygrad.codegen.opt.postrange import Scheduler
+    from tinygrad.uop.ops import AxisType
+    tc = _first_half_tc()
+    n, m, k = tc.dims
+    a, b = Tensor.empty(4, m*2, k*4, dtype=tc.dtype_in), Tensor.empty(4, k*4, n*2, dtype=tc.dtype_in)
+    ast = a.matmul(b, dtype=tc.dtype_out).exp().sum(0).schedule_linear().src[-1].src[0]
+    base = Scheduler(ast, Device[Device.DEFAULT].renderer)
+    base.convert_loop_to_global()
+    base.apply_opt(Opt(OptOps.TC, 0, (-1, 0, 1)))
+    assert len(base.tc_unroll_rngs), "TC must record its UNROLL contraction fragments"
+    assert len(base.unrollable_dims) == 2, "expected the K remnant and the batch reduce"
+    rejected = 0
+    for axis in range(2):  # one axis is the K remnant (GROUP on batch is fine), the other is batch
+      s = base.copy()
+      s.apply_opt(Opt(OptOps.UNROLL, axis, 0))
+      # simulate simplification of the degenerate size-1 REDUCE remnant left by the full unroll,
+      # so only the non-TC UNROLL context remains to trip the check
+      degenerate = [u for u in s.ast.backward_slice if u.op is Ops.RANGE and u.arg[-1] is AxisType.REDUCE and u.vmax == 0]
+      s.ast = s.ast.substitute({u: u.const_like(0) for u in degenerate})
+      try: s.apply_opt(Opt(OptOps.GROUP, 0, 4))
+      except KernelOptError: rejected += 1
+    assert rejected == 1, f"GROUP alongside a non-TC UNROLL context must be rejected, got {rejected} rejections"
+
 if __name__ == '__main__':
   unittest.main()
