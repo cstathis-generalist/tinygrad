@@ -225,5 +225,55 @@ class TestTensorCores(unittest.TestCase):
         #assert u.src[-1].dtype == dtypes.float.vec(prod(tc.thread_local_sizes[2]))
         assert u.src[-1].src[0].op != Ops.STORE
 
+  def _first_half_tc(self):
+    tcs = [tc for tc in Device[Device.DEFAULT].renderer.tensor_cores if tc.dtype_in is dtypes.half]
+    if not tcs: self.skipTest("test requires a half tensor core")
+    return tcs[0]
+
+  @Context(ALLOW_TF32=1)
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tensor_cores_four_local_dims(self):
+    tc = self._first_half_tc()
+    n, m, k = tc.dims
+    a, b = Tensor.rand(m*8, k*2, dtype=tc.dtype_in), Tensor.rand(k*2, n*4, dtype=tc.dtype_in)
+    opts = [Opt(OptOps.LOCAL, 0, 2), Opt(OptOps.LOCAL, 0, 2), Opt(OptOps.LOCAL, 1, 2)]
+    helper_linearizer_opt(a.matmul(b, dtype=tc.dtype_out), [opts], apply_tc=True, atol=3e-2, rtol=1e-3, check_default_opt=False)
+
+  @Context(ALLOW_TF32=1)
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tensor_cores_group(self):
+    tc = self._first_half_tc()
+    n, m, k = tc.dims
+    a, b = Tensor.rand(m*4, k*16, dtype=tc.dtype_in), Tensor.rand(k*16, n*4, dtype=tc.dtype_in)
+    plans = [
+      [Opt(OptOps.GROUPTOP, 0, 16)],
+      [Opt(OptOps.LOCAL, 1, 2), Opt(OptOps.UPCAST, 1, 2), Opt(OptOps.GROUP, 0, 4)],
+    ]
+    helper_linearizer_opt(a.matmul(b, dtype=tc.dtype_out), plans, apply_tc=True, atol=3e-2, rtol=1e-3, check_default_opt=False)
+
+  @Context(ALLOW_TF32=1)
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tensor_cores_group_rejects_unrelated_unroll(self):
+    from tinygrad.codegen.opt.postrange import Scheduler
+    from tinygrad.uop.ops import AxisType
+    tc = self._first_half_tc()
+    n, m, k = tc.dims
+    a, b = Tensor.empty(4, m*2, k*4, dtype=tc.dtype_in), Tensor.empty(4, k*4, n*2, dtype=tc.dtype_in)
+    ast = a.matmul(b, dtype=tc.dtype_out).exp().sum(0).schedule_linear().src[-1].src[0]
+    base = Scheduler(ast, Device[Device.DEFAULT].renderer)
+    base.convert_loop_to_global()
+    base.apply_opt(Opt(OptOps.TC, 0, (-1, 0, 1)))
+    assert len(base.tc_unroll_rngs), "TC must record its UNROLL contraction fragments"
+    rejected = 0
+    for axis in range(len(base.unrollable_dims)):
+      s = base.copy()
+      s.apply_opt(Opt(OptOps.UNROLL, axis, 0))
+      # Remove the size-1 REDUCE remnant so the guard must distinguish TC and enclosing UNROLLs.
+      degenerate = [u for u in s.ast.backward_slice if u.op is Ops.RANGE and u.arg[-1] is AxisType.REDUCE and u.vmax == 0]
+      s.ast = s.ast.substitute({u: u.const_like(0) for u in degenerate})
+      try: s.apply_opt(Opt(OptOps.GROUP, 0, 4))
+      except KernelOptError: rejected += 1
+    assert rejected == 1, f"GROUP alongside a non-TC UNROLL context must be rejected, got {rejected} rejections"
+
 if __name__ == '__main__':
   unittest.main()

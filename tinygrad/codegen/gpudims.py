@@ -24,8 +24,8 @@ def _split_dims(dims, max_sizes):
       _dims[i], _dims[(i+1)%len(_dims)] = _dims[i]//div, _dims[(i+1)%len(_dims)]*div
   return tuple(_dims[:2] if _dims[2] == 1 else _dims)
 
-def get_grouped_dims(prefix, dims:tuple[sint, ...], max_sizes:tuple[int, ...]|None, reverse=False) -> list[UOp]:
-  if reverse: return get_grouped_dims(prefix, dims[::-1], max_sizes)[::-1]
+def get_grouped_dims(prefix, dims:tuple[sint, ...], max_sizes:tuple[int, ...]|None, reverse=False, start_idx=0) -> list[UOp]:
+  if reverse: return get_grouped_dims(prefix, dims[::-1], max_sizes, start_idx=start_idx)[::-1]
   if max_sizes is None: limited = dims
   else:
     # try to group first: (a, b, c, d) -> (ab, c, d)
@@ -34,7 +34,7 @@ def get_grouped_dims(prefix, dims:tuple[sint, ...], max_sizes:tuple[int, ...]|No
     if len(limited) > len(max_sizes): raise RuntimeError(f"cannot limit dim {dims=}, {max_sizes=}")
     # try to split up dims: (a,) -> (b, c)
     if limited == dims: limited = _split_dims(dims, max_sizes)
-  raw_idxs = [UOp.special(s, f"{prefix}{i}") for i,s in enumerate(limited)]
+  raw_idxs = [UOp.special(s, f"{prefix}{i+start_idx}") for i,s in enumerate(limited)]
   flat = sum(idx * math.prod(limited[i+1:]) for i,idx in enumerate(raw_idxs))
   return [ssimplify(flat // math.prod(dims[i+1:])) if i == 0 else ssimplify((flat // math.prod(dims[i+1:])) % dims[i]) for i in range(len(dims))]
 
@@ -63,7 +63,16 @@ def add_gpudims(ctx:Renderer, s:UOp):
     idxs = get_grouped_dims("idx", global_shape, ctx.global_max, reverse=True)
   else:
     # define indexes for GPU-like execution
-    local_idxs = get_grouped_dims("lidx", local_shape, ctx.local_max)
+    # keep WARP on lidx0: WMMA lane ids cannot be reconstructed from grouped dimensions.
+    # _apply_tc_opt creates at most one WARP range, with axis id -1, so it sorts first.
+    warp_dims = [r for r in local_dims if all_ranges[r].arg[-1] == AxisType.WARP]
+    if warp_dims:
+      assert warp_dims == local_dims[:1], "at most one WARP range, sorted first in local dims"
+      warp_idx = UOp.special(local_shape[0], "lidx0")
+      rest_max = ctx.local_max[1:] if ctx.local_max is not None else None
+      local_idxs = [warp_idx] + get_grouped_dims("lidx", local_shape[1:], rest_max, start_idx=1)
+    else:
+      local_idxs = get_grouped_dims("lidx", local_shape, ctx.local_max)
     hw_local = [_dim_max(u.src[0]) for u in local_idxs if u.op is Ops.SPECIAL]
     global_max = ctx.global_max if ctx.global_prod_max is None else \
       tuple(min(gm, pm//l) for gm,pm,l in zip(ctx.global_max or ctx.global_prod_max, ctx.global_prod_max, hw_local+[1]*3))

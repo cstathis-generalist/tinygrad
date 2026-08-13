@@ -18,6 +18,8 @@ class Scheduler:
     self.dont_use_locals = self.ast.arg.dont_use_locals if self.ast.arg is not None else False
     self.applied_opts = list(self.ast.arg.applied_opts) if self.ast.arg is not None else []
     self.opt_range = count(start=max([x.arg[0] for x in self.rngs], default=0)+1)
+    # range ids of the UNROLL contraction fragments created by _apply_tc_opt
+    self.tc_unroll_rngs: frozenset[int] = frozenset()
 
   @property
   def rngs(self):
@@ -45,6 +47,7 @@ class Scheduler:
     ret = Scheduler(self.ast, self.ren)
     ret.dont_use_locals = self.dont_use_locals
     ret.applied_opts = self.applied_opts[:]
+    ret.tc_unroll_rngs = self.tc_unroll_rngs
     if hasattr(self, 'tensor_core'): ret.tensor_core = self.tensor_core
     return ret
 
@@ -151,9 +154,12 @@ class Scheduler:
         smem_sz = amt*upcast_local_sz*self.reduceop.dtype.itemsize
         check(smem_sz <= self.ren.shared_max, f"exceeds maximum shared memory size: needs {smem_sz}, max {self.ren.shared_max}")
       if self.reduceop is not None and (opt.op in {OptOps.GROUP, OptOps.GROUPTOP}):
-        # We currently dont support a group within another rudece, TODO: fix if-contexts
+        # We currently dont support a group within another reduce, TODO: fix if-contexts
         reduce = [u for u in self.ast.backward_slice if u.op is Ops.REDUCE and rng in merge_dicts([r.ranges for r in u.src[1:]])][0]
-        check(not any(u.arg[-1] in (AxisType.REDUCE, AxisType.UNROLL, AxisType.GROUP_REDUCE) for u in reduce.ranges),
+        # the UNROLL contraction fragments created by _apply_tc_opt are not a nested reduce:
+        # the group staging buffer keeps per-lane WMMA fragments (see fix_group_for_reduce)
+        check(not any(u.arg[-1] in (AxisType.REDUCE, AxisType.UNROLL, AxisType.GROUP_REDUCE) and
+                      not (u.arg[-1] is AxisType.UNROLL and u.arg[0] in self.tc_unroll_rngs) for u in reduce.ranges),
           "cannot have a GROUP_REDUCE inside another reduce")
 
       if opt.op is OptOps.UNROLL:
@@ -171,7 +177,6 @@ class Scheduler:
         check(all(x is not AxisType.THREAD for x in self.axis_types), "already threaded")
         check(rng in self._globalizable_rngs(), "can't apply range to this dim")
       if opt.op in {OptOps.GROUP, OptOps.GROUPTOP}:
-        check(all(x.op is not OptOps.TC for x in self.applied_opts), "no grouping with tensor cores")  # TODO: why is this wrong?
         check(not self.dont_use_locals, "can't use locals")
         check(rng.arg[-1] == AxisType.REDUCE, "group is for reduce")
       ret = self.shift_to(rng, amt, opt_to_at[opt.op], top=opt.op in {OptOps.GROUPTOP, OptOps.THREAD})
@@ -276,6 +281,7 @@ class Scheduler:
           for _, amt in tc.get_reduce_axes():
             axes[2], new_range = self.shift_to(axes[2], amt, AxisType.UNROLL)
             ne.append(new_range)
+            self.tc_unroll_rngs |= {new_range.arg[0]}
 
           if use_tensor_cores != 2:
             # fix the srcs

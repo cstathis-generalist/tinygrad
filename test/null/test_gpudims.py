@@ -117,5 +117,18 @@ class TestGroupedDims(unittest.TestCase):
     self._check_grouped_dims("gidx", (2,3,4), None, False, [2,3,4])
     self._check_grouped_dims("gidx", (100,), None, False, [100])
 
+  def test_warp_dim_not_merged(self):
+    # a WARP range (from tensor cores) plus three LOCAL ranges exceeds the 3 hardware local dims.
+    # packing must keep WARP alone on lidx0: WMMA lane ids cannot be reconstructed from grouped dims.
+    w = UOp.range(32, -1, AxisType.WARP)
+    l0, l1, l2 = [UOp.range(2, i, AxisType.LOCAL) for i in range(3)]
+    idx = ((w*2 + l0)*2 + l1)*2 + l2
+    sink = UOp.param(0, dtypes.float, (256,)).index(idx).store(UOp.const(1.0)).end(w, l0, l1, l2).sink(arg=KernelInfo())
+    class R(Renderer): global_max, local_max = (2147483647, 65535, 65535), (1024, 1024, 64)
+    specials = {u.arg: u.src[0].val for u in add_gpudims(R(Target()), sink).toposort() if u.op is Ops.SPECIAL}
+    lidx_sizes = [v for k,v in sorted(specials.items()) if k.startswith("lidx")]
+    self.assertEqual(lidx_sizes[0], 32, f"warp must map directly to lidx0, got {specials}")
+    self.assertEqual(math.prod(lidx_sizes[1:]), 8, f"other locals must pack into remaining dims, got {specials}")
+
 if __name__ == '__main__':
   unittest.main()
